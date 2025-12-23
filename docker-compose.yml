@@ -1,0 +1,9 @@
+services:
+  epay-bot:
+    image: ghcr.io/sky22333/epay-bot
+    container_name: epay-bot
+    restart: always
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TELEGRAM_BOT_TOKEN=your_token_here

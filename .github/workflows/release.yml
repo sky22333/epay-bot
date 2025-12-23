@@ -1,0 +1,89 @@
+name: 发布软件包
+
+on:
+  workflow_dispatch:  # 手动触发
+    inputs:
+      version:
+        description: '版本号 (例如: v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: 设置Go环境
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.5'
+          
+      - name: 获取版本号
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=${{ github.event.inputs.version }}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "版本号: $VERSION"
+          
+      - name: 生成变更日志
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          
+          if [ -n "$PREV_TAG" ]; then
+            echo "changelog<<EOF" >> $GITHUB_OUTPUT
+            echo "## 更新内容" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            git log --pretty=format:"- %s" $PREV_TAG..HEAD >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "changelog=## 首次发布" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: 创建构建目录
+        run: |
+          mkdir -p build
+          
+      - name: 编译二进制文件
+        run: |
+          # linux AMD64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o build/epay-bot-amd64 .
+          
+          # linux ARM64
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o build/epay-bot-arm64 .
+          
+      - name: 准备发布文件
+        run: |
+          cd build
+          ls -la epay-bot-*
+          
+      - name: 创建或更新Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: "epay-bot ${{ steps.version.outputs.version }}"
+          body: |
+            
+            ${{ steps.changelog.outputs.changelog }}
+            
+            #### linux
+            - **linux AMD64**: `epay-bot-amd64`
+            - **linux ARM64**: `epay-bot-arm64`
+            
+          files: |
+            build/epay-bot-*
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
