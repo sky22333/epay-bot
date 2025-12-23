@@ -29,10 +29,6 @@ docker run -d \
 *   **查询数据**：配置完成后，可查询最近订单和结算记录。
 *   **开启通知**：点击“开启自动通知”以接收实时推送。
 
-UA请求头：
-```
-EpayBot-Client/1.0 (Monitoring Orders & Settlements)
-```
 ## 目录结构
 
 *   `bot/`: 机器人核心逻辑与交互处理
@@ -42,5 +38,7 @@ EpayBot-Client/1.0 (Monitoring Orders & Settlements)
 *   `main.go`: 程序入口
 
 
-
-
+#### UA请求头
+```
+EpayBot-Client/1.0 (Monitoring Orders & Settlements)
+```
