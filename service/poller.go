@@ -1,6 +1,8 @@
 package service
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"epay-bot/db"
 	"epay-bot/model"
 	"fmt"
@@ -24,9 +26,13 @@ type PollerManager struct {
 }
 
 type pollJob struct {
-	chatID   int64
-	interval time.Duration
-	stop     chan struct{}
+	chatID         int64
+	interval       time.Duration
+	stop           chan struct{}
+	lastPollUpdate time.Time
+
+	lastOrderSig  string
+	lastSettleSig string
 }
 
 func NewPollerManager(database *db.DB, epay *EpayService, notifier Notifier) *PollerManager {
@@ -107,22 +113,24 @@ func (pm *PollerManager) runJob(job *pollJob) {
 		case <-pm.stopCh:
 			return
 		case <-ticker.C:
-			// Adjust ticker if interval changed
-			// Note: time.Ticker doesn't support dynamic update easily in loop,
-			// usually we just reset it or use time.After/Sleep.
-			// For simplicity and adaptiveness, let's use time.Sleep loop instead of ticker for next iteration
 		}
 
 		// Perform check
 		info, err := pm.db.GetMerchantInfo(job.chatID)
 		if err != nil || info == nil {
 			log.Printf("Merchant info missing for chat %d", job.chatID)
-			// Wait a bit
 			time.Sleep(60 * time.Second)
 			continue
 		}
 
-		pm.db.UpdateLastPollTime(job.chatID)
+		// Update LastPollTime with throttling (every 5m)
+		if time.Since(job.lastPollUpdate) > 300*time.Second {
+			if err := pm.db.UpdateLastPollTime(job.chatID); err != nil {
+				log.Printf("Failed to update poll time for %d: %v", job.chatID, err)
+			} else {
+				job.lastPollUpdate = time.Now()
+			}
+		}
 
 		// 检查订单
 		var errOrder, errSettle error
@@ -130,22 +138,38 @@ func (pm *PollerManager) runJob(job *pollJob) {
 		if err != nil {
 			log.Printf("Error getting orders for %d: %v", job.chatID, err)
 			errOrder = err
-		} else if len(orders) > 0 {
-			for _, order := range orders {
-				// 状态 1 表示成功
-				status := fmt.Sprintf("%v", order.Status)
-				if status == "1" {
-					notified, err := pm.db.IsOrderNotified(order.TradeNo, job.chatID)
-					if err != nil {
-						log.Printf("警告: 检查订单是否已通知时数据库出错 (ChatID: %d, Order: %s): %v", job.chatID, order.TradeNo, err)
-						continue
-					}
-					if !notified {
-						pm.notifier.NotifyOrder(job.chatID, order)
-						if err := pm.db.MarkOrderNotified(order.TradeNo, job.chatID); err != nil {
-							log.Printf("警告: 标记订单为已通知失败 (ChatID: %d, Order: %s): %v", job.chatID, order.TradeNo, err)
+		} else {
+			newOrderSig := generateOrderSignature(orders)
+			if newOrderSig != job.lastOrderSig {
+				ordersSuccess := true
+				if len(orders) > 0 {
+					for _, order := range orders {
+						// 状态 1 表示成功
+						status := fmt.Sprintf("%v", order.Status)
+						if status == "1" {
+							notified, err := pm.db.IsOrderNotified(order.TradeNo, job.chatID)
+							if err != nil {
+								log.Printf("警告: 检查订单是否已通知时数据库出错 (ChatID: %d, Order: %s): %v", job.chatID, order.TradeNo, err)
+								ordersSuccess = false
+								continue
+							}
+							if !notified {
+								err := pm.notifier.NotifyOrder(job.chatID, order)
+								if err != nil {
+									log.Printf("警告: 发送订单通知失败 (ChatID: %d, Order: %s): %v", job.chatID, order.TradeNo, err)
+									ordersSuccess = false
+								} else {
+									if err := pm.db.MarkOrderNotified(order.TradeNo, job.chatID); err != nil {
+										log.Printf("警告: 标记订单为已通知失败 (ChatID: %d, Order: %s): %v", job.chatID, order.TradeNo, err)
+										ordersSuccess = false
+									}
+								}
+							}
 						}
 					}
+				}
+				if ordersSuccess {
+					job.lastOrderSig = newOrderSig
 				}
 			}
 		}
@@ -155,23 +179,36 @@ func (pm *PollerManager) runJob(job *pollJob) {
 		if err != nil {
 			log.Printf("Error getting settlements for %d: %v", job.chatID, err)
 			errSettle = err
-		} else if len(settlements) > 0 {
-			for _, settle := range settlements {
-				status := fmt.Sprintf("%v", settle.Status)
-				if status == "1" {
-					notified, err := pm.db.IsSettlementNotified(settle.ID.String(), job.chatID)
-					if err != nil {
-						log.Printf("警告: 检查结算是否已通知时数据库出错 (ChatID: %d, SettleID: %s): %v", job.chatID, settle.ID, err)
-						continue
-					}
-					if !notified {
-						if err := pm.notifier.NotifySettlement(job.chatID, settle); err != nil {
-							continue
+		} else {
+			newSettleSig := generateSettlementSignature(settlements)
+			if newSettleSig != job.lastSettleSig {
+				settleSuccess := true
+				if len(settlements) > 0 {
+					for _, settle := range settlements {
+						status := fmt.Sprintf("%v", settle.Status)
+						if status == "1" {
+							notified, err := pm.db.IsSettlementNotified(settle.ID.String(), job.chatID)
+							if err != nil {
+								log.Printf("警告: 检查结算是否已通知时数据库出错 (ChatID: %d, SettleID: %s): %v", job.chatID, settle.ID, err)
+								settleSuccess = false
+								continue
+							}
+							if !notified {
+								if err := pm.notifier.NotifySettlement(job.chatID, settle); err != nil {
+									log.Printf("警告: 发送结算通知失败 (ChatID: %d, SettleID: %s): %v", job.chatID, settle.ID, err)
+									settleSuccess = false
+									continue
+								}
+								if err := pm.db.MarkSettlementNotified(settle.ID.String(), job.chatID); err != nil {
+									log.Printf("警告: 标记结算为已通知失败 (ChatID: %d, SettleID: %s): %v", job.chatID, settle.ID, err)
+									settleSuccess = false
+								}
+							}
 						}
-						if err := pm.db.MarkSettlementNotified(settle.ID.String(), job.chatID); err != nil {
-							log.Printf("警告: 标记结算为已通知失败 (ChatID: %d, SettleID: %s): %v", job.chatID, settle.ID, err)
-						}
 					}
+				}
+				if settleSuccess {
+					job.lastSettleSig = newSettleSig
 				}
 			}
 		}
@@ -188,9 +225,28 @@ func (pm *PollerManager) runJob(job *pollJob) {
 			job.interval = 2 * time.Second
 		}
 
-		// Wait for next tick
 		ticker.Reset(job.interval)
 	}
 }
 
+func generateOrderSignature(orders []model.Order) string {
+	if len(orders) == 0 {
+		return ""
+	}
+	h := md5.New()
+	for _, o := range orders {
+		fmt.Fprintf(h, "%s|%v;", o.TradeNo, o.Status)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
+func generateSettlementSignature(settlements []model.Settlement) string {
+	if len(settlements) == 0 {
+		return ""
+	}
+	h := md5.New()
+	for _, s := range settlements {
+		fmt.Fprintf(h, "%s|%v|%s;", s.ID, s.Status, s.Realmoney)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
