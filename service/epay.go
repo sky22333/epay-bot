@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -39,7 +40,11 @@ func (s *EpayService) GetOrders(domain, pid, key string) ([]model.Order, error) 
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		errMsg := err.Error()
+		if key != "" && strings.Contains(errMsg, key) {
+			errMsg = strings.ReplaceAll(errMsg, key, "***")
+		}
+		return nil, fmt.Errorf("request failed: %s", errMsg)
 	}
 	defer resp.Body.Close()
 
@@ -79,7 +84,11 @@ func (s *EpayService) GetSettlements(domain, pid, key string) ([]model.Settlemen
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		errMsg := err.Error()
+		if key != "" && strings.Contains(errMsg, key) {
+			errMsg = strings.ReplaceAll(errMsg, key, "***")
+		}
+		return nil, fmt.Errorf("request failed: %s", errMsg)
 	}
 	defer resp.Body.Close()
 
